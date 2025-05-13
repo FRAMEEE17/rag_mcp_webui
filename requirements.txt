@@ -1,0 +1,27 @@
+# Core dependencies
+fastapi
+uvicorn
+python-dotenv
+pydantic
+# MCP integration
+mcp[cli]
+# State management
+redis
+asyncio
+pinecone-client
+openai
+anthropic
+sentence-transformers
+# Web
+httpx
+beautifulsoup4
+requests
+# Data processing
+numpy
+pandas
+black
+isort
+flake8
+# Documentation
+mkdocs
+mkdocs-material
