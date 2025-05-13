@@ -1,0 +1,23 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    environment:
+      - PYTHONPATH=/app
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY}
+      - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
+      - WEATHER_API_KEY=${WEATHER_API_KEY}
+      - DEFAULT_LLM_MODEL=google/gemma-7b
+
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    ports:
+      - "3000:8080"
+    environment:
+      - OLLAMA_API_BASE_URL=http://app:8000
+      - WEBUI_AUTH_ENABLED=false
+    depends_on:
+      - app
