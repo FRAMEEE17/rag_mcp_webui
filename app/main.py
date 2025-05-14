@@ -102,7 +102,7 @@ async def openai_compatible_chat(request: Request):
         }
     }
 
-# NEW: Ollama-compatible endpoint for OpenWebUI
+# Ollama-compatible endpoint for OpenWebUI
 @app.post("/api/chat")
 async def ollama_compatible_chat(request: Request):
     data = await request.json()
@@ -166,10 +166,11 @@ async def ollama_models():
         ]
     }
 
-# Mount MCP application
-from mcp.server.fastmcp import get_app as get_mcp_app
-app.mount("/mcp", get_mcp_app(get_default_mcp_server()))
-
+# Get the existing MCP server instance
+mcp_server = get_default_mcp_server()
+# Mount it at /mcp path using Streamable HTTP transport
+app.mount("/mcp", mcp_server.streamable_http_app())
+# app.mount("/mcp", mcp_server.sse_app())
 # Create a static directory for web interface
 os.makedirs("static", exist_ok=True)
 
