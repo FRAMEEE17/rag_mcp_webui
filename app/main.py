@@ -46,12 +46,14 @@ async def list_tools():
     registry = get_tool_registry()
     return {"tools": registry.list_tools()}
 
-# OpenAI-compatible endpoint for OpenWebUI integration
+# app/main.py - Update the openai_compatible_chat function
+
 @app.post("/v1/chat/completions")
 async def openai_compatible_chat(request: Request):
     data = await request.json()
     
     messages = data.get("messages", [])
+    stream = data.get("stream", False)
     if not messages:
         return {"error": "No messages provided"}
     
@@ -69,40 +71,155 @@ async def openai_compatible_chat(request: Request):
             system_message = msg.get("content")
             break
     
-    # Get LLM client (NVIDIA Gemma)
+    # Get relevant tools for the query using our tool registry
+    registry = get_tool_registry()
+    relevant_tools = await get_relevant_tools(query, registry)
+    
+    # Transform tools to OpenAI function calling format
+    tools_format = []
+    for tool in relevant_tools:
+        # Format arguments as OpenAI parameters schema
+        properties = {}
+        required = []
+        
+        for arg_name, arg_info in tool.get("arguments", {}).items():
+            properties[arg_name] = {
+                "type": arg_info.get("type", "string"),
+                "description": arg_info.get("description", "")
+            }
+            if arg_info.get("required", False):
+                required.append(arg_name)
+        
+        tools_format.append({
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required
+                }
+            }
+        })
+    
+    # Get LLM client
     model_name = data.get("model", os.getenv("DEFAULT_LLM_MODEL", "google/gemma-7b"))
     llm = get_llm_client(model_name)
     
     if system_message:
         llm.set_system_prompt(system_message)
     
-    # Generate response
-    response_text = await llm.generate_response(query)
+    # Add tool information to the prompt
+    tools_prompt = ""
+    if tools_format:
+        tools_prompt = "You have access to the following tools:\n"
+        for tool in relevant_tools:
+            args_info = ", ".join([f"{k}" for k in tool.get("arguments", {})])
+            tools_prompt += f"- {tool['name']}({args_info}): {tool['description']}\n"
+        
+        tools_prompt += "\nIf the user's request can be addressed using these tools, describe how you would use them."
     
-    # Format in OpenAI-compatible format
-    return {
-        "id": "chatcmpl-" + os.urandom(12).hex(),
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model_name,
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": response_text
-                },
-                "finish_reason": "stop"
+    enhanced_prompt = f"{query}\n\n{tools_prompt}"
+    
+    # Handle streaming
+    if stream:
+        async def generate():
+            # Start stream with an initial chunk
+            chunk_id = f"chatcmpl-{os.urandom(12).hex()}"
+            async for chunk in llm.generate_response_stream(enhanced_prompt):
+                chunk_data = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "content": chunk
+                            },
+                            "finish_reason": None
+                        }
+                    ]
+                }
+                yield f"data: {json.dumps(chunk_data)}\n\n"
+            
+            # End stream with a final chunk
+            final_data = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop"
+                    }
+                ]
             }
-        ],
-        "usage": {
-            "prompt_tokens": len(query),
-            "completion_tokens": len(response_text),
-            "total_tokens": len(query) + len(response_text)
+            yield f"data: {json.dumps(final_data)}\n\n"
+            yield "data: [DONE]\n\n"
+        
+        return StreamingResponse(generate(), media_type="text/event-stream")
+    else:
+        # Generate response as normal
+        response_text = await llm.generate_response(enhanced_prompt)
+        
+        # Return OpenAI-compatible format with tools
+        return {
+            "id": "chatcmpl-" + os.urandom(12).hex(),
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model_name,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": response_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": len(enhanced_prompt),
+                "completion_tokens": len(response_text),
+                "total_tokens": len(enhanced_prompt) + len(response_text)
+            },
+            "tools": tools_format  # This is key for OpenWebUI to show tools
         }
-    }
 
-# NEW: Ollama-compatible endpoint for OpenWebUI
+# Helper function to get relevant tools for a query using TF-IDF-based similarity (O(n) complexity)
+async def get_relevant_tools(query: str, registry, max_tools: int = 5) -> list:
+    """Get the most relevant tools for a query using TF-IDF based matching.
+    This is a simplified implementation for the quick-start demo with O(n) complexity."""
+    tools = registry.list_tools()
+    if not tools:
+        return []
+    
+    # Simple term frequency calculation
+    query_terms = set(query.lower().split())
+    
+    # Score tools based on term overlap (TF-IDF simplified)
+    scored_tools = []
+    for tool in tools:
+        tool_text = f"{tool['name']} {tool['description']}".lower()
+        tool_terms = set(tool_text.split())
+        
+        # Calculate Jaccard similarity (intersection over union)
+        intersection = len(query_terms.intersection(tool_terms))
+        union = len(query_terms.union(tool_terms))
+        similarity = intersection / max(1, union)  # Avoid division by zero
+        
+        scored_tools.append((similarity, tool))
+    
+    # Sort by score and take top N tools
+    scored_tools.sort(reverse=True, key=lambda x: x[0])
+    return [tool for _, tool in scored_tools[:max_tools]]
+
+# Ollama-compatible endpoint for OpenWebUI
 @app.post("/api/chat")
 async def ollama_compatible_chat(request: Request):
     data = await request.json()
@@ -143,33 +260,41 @@ async def ollama_compatible_chat(request: Request):
         "done": True
     }
 
-# Ollama-compatible model list endpoint for OpenWebUI
-@app.get("/api/tags")
-async def ollama_models():
-    """Return available models in Ollama-compatible format"""
-    return {
-        "models": [
-            {
-                "name": "gemma-7b",
-                "model": "google/gemma-7b",
-                "modified_at": int(time.time()),
-                "size": 7000000000,
-                "digest": "nvidia-nemo",
-                "details": {
-                    "format": "gguf",
-                    "family": "gemma",
-                    "families": ["gemma", "google"],
-                    "parameter_size": "7B",
-                    "quantization_level": "none"
-                }
-            }
-        ]
-    }
+# @app.get("/health")
+# async def health_check():
+#     """Health check endpoint for monitoring."""
+#     health_status = {
+#         "status": "healthy",
+#         "components": {}
+#     }
+    
+#     # Check Redis connection
+#     try:
+#         state_manager = get_state_manager()
+#         redis_ok = await state_manager.redis_client.ping()
+#         health_status["components"]["redis"] = "connected" if redis_ok else "disconnected"
+#     except Exception as e:
+#         health_status["components"]["redis"] = f"error: {str(e)}"
+    
+#     # Get tool count
+#     try:
+#         registry = get_tool_registry()
+#         tools = registry.list_tools()
+#         health_status["components"]["tools"] = f"{len(tools)} tools available"
+#     except Exception as e:
+#         health_status["components"]["tools"] = f"error: {str(e)}"
+    
+#     # Overall status depends on components
+#     if "error" in health_status["components"].get("redis", ""):
+#         health_status["status"] = "degraded"
+    
+#     return health_status
 
-# Mount MCP application
-from mcp.server.fastmcp import get_app as get_mcp_app
-app.mount("/mcp", get_mcp_app(get_default_mcp_server()))
-
+# Get the existing MCP server instance
+mcp_server = get_default_mcp_server()
+# Mount it at /mcp path using Streamable HTTP transport
+app.mount("/mcp", mcp_server.streamable_http_app())
+# app.mount("/mcp", mcp_server.sse_app())
 # Create a static directory for web interface
 os.makedirs("static", exist_ok=True)
 
